@@ -1,8 +1,21 @@
 {
-  "name": "dsh-llm-retry-settings",
-  "version": "0.1.19",
-  "description": "DSH 插件：LLM 自动重试设置卡片——重试次数/退避/抖动与 30 个错误码可勾选（也能自己输入），可按 provider/model 单独设策略、尊重上游 Retry-After 建议、回答被输出 token 上限截断时自动续写且提示词可改，内置重试观测面板，改完实时生效。",
-  "keywords": ["dsh", "dsh-plugin", "llm", "retry", "auto-retry", "auto-continue", "max-tokens", "settings", "deepseek"],
+  "name": "dsh-llm-retry-watchdog",
+  "version": "0.2.0",
+  "description": "DSH 插件：LLM 重试耗尽后的看门狗——瞬时错误按 2→5→15→30 分钟升级退避持续补投「继续」，直到恢复/人工接手/硬上限。fork 自 dsh-llm-retry-settings。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "llm",
+    "retry",
+    "auto-retry",
+    "auto-continue",
+    "max-tokens",
+    "settings",
+    "deepseek",
+    "watchdog",
+    "auto-resume",
+    "backoff"
+  ],
   "type": "module",
   "main": "lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -16,16 +29,20 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "lib", "cordis.patch.yml"],
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml"
+  ],
   "license": "MIT",
   "engines": {
     "dsh": ">=0.1.6-alpha.1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zeng6125-rgb/dsh-llm-retry-settings.git"
+    "url": "git+https://github.com/Geetie/dsh-llm-retry-watchdog.git"
   },
-  "homepage": "https://github.com/zeng6125-rgb/dsh-llm-retry-settings",
+  "homepage": "https://github.com/Geetie/dsh-llm-retry-watchdog",
   "bugs": {
     "url": "https://github.com/zeng6125-rgb/dsh-llm-retry-settings/issues"
   },
@@ -42,6 +59,7 @@
     }
   },
   "devDependencies": {
+    "@deepseek-ai/schemastery": "3.18.5",
     "@types/node": "^24.13.3",
     "esbuild": "^0.28.2",
     "typescript": "^5.9.3"

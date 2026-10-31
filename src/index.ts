@@ -358,6 +358,14 @@ export const DEFAULTS = {
   continuationPrompt: '',
   /** 瞬时错误（重试彻底失败）也自动续写一轮；默认关闭。 */
   continueOnError: false,
+  /**
+   * 瞬时错误升级退避计划表（毫秒）：错误链上第 N 次自动重试前等待
+   * scheduleMs[min(N-1, len-1)]（2→5→15→30min 封顶）。每次成功回合或人工发言清零。
+   * 非设置卡片字段：只能经 patch yml 配置。
+   */
+  errorRetryScheduleMs: [120000, 300000, 900000, 1800000],
+  /** 瞬时错误自动重试的硬上限（次/错误链）：到达后停止调度并写日志，等待人工介入。 */
+  errorRetryMaxAttempts: 10,
   /** 尊重上游 Retry-After 建议（providerRetryAfterMs）；默认开启。 */
   honorProviderRetryAfter: true,
   /** 尊重上游建议时的等待上限，默认 60 秒。 */
@@ -384,6 +392,10 @@ export interface Config {
   continuationPrompt: string
   /** 会话因瞬时错误结束时也自动续写一轮（确定性错误不续写）。 */
   continueOnError: boolean
+  /** 瞬时错误升级退避计划表（毫秒）：第 N 次重试前等待 scheduleMs[min(N-1, len-1)]。 */
+  errorRetryScheduleMs: number[]
+  /** 瞬时错误自动重试硬上限（次/错误链），到顶停手等人工。 */
+  errorRetryMaxAttempts: number
   /**
    * 上游给了 Retry-After 建议（failure.providerRetryAfterMs）时，自动把退避上限抬到装得下它。
    *
@@ -421,6 +433,12 @@ export const Config = z.object({
   maxContinuations: vol(z.number().step(1).min(0).default(DEFAULTS.maxContinuations)),
   continuationPrompt: vol(z.string().default(DEFAULTS.continuationPrompt)),
   continueOnError: vol(z.boolean().default(DEFAULTS.continueOnError)),
+  // 非设置卡片字段（无 vol()）：只从 patch yml / settings base 读，避免动客户端表单兼容面。
+  errorRetryScheduleMs: z
+    .array(z.number().min(1000))
+    .min(1)
+    .default([...DEFAULTS.errorRetryScheduleMs]),
+  errorRetryMaxAttempts: vol(z.number().step(1).min(1).max(100).default(DEFAULTS.errorRetryMaxAttempts)),
   honorProviderRetryAfter: vol(z.boolean().default(DEFAULTS.honorProviderRetryAfter)),
   maxProviderRetryAfterMs: vol(z.number().min(1000).default(DEFAULTS.maxProviderRetryAfterMs)),
   overrides: vol(
@@ -461,7 +479,11 @@ const asFloat = (v: unknown, min: number, max: number): number | undefined => {
 }
 
 /** DEFAULTS 的 Config 视图：DEFAULTS 是 as const，数组需先解掉 readonly 才能当回退值。 */
-const DEFAULTS_CONFIG: Config = { ...DEFAULTS, retryableCodes: [...DEFAULTS.retryableCodes] }
+const DEFAULTS_CONFIG: Config = {
+  ...DEFAULTS,
+  retryableCodes: [...DEFAULTS.retryableCodes],
+  errorRetryScheduleMs: [...DEFAULTS.errorRetryScheduleMs],
+}
 
 /**
  * 字段级收敛的唯一实现：raw 中类型合法的字段覆盖 fallback，其余保留 fallback。
@@ -487,6 +509,17 @@ function coerceConfig(raw: Partial<Config> | undefined | null, fallback: Config)
     maxContinuations: asInt(raw?.maxContinuations, 0) ?? fallback.maxContinuations,
     continuationPrompt: typeof prompt === 'string' ? prompt : fallback.continuationPrompt,
     continueOnError: asBool(raw?.continueOnError) ?? fallback.continueOnError,
+    errorRetryScheduleMs: (() => {
+      const schedule = unvol(raw?.errorRetryScheduleMs)
+      if (Array.isArray(schedule)) {
+        const parsed = schedule
+          .map((v) => (typeof v === 'number' && Number.isFinite(v) ? Math.max(1000, Math.floor(v)) : 0))
+          .filter((v) => v >= 1000)
+        if (parsed.length > 0) return parsed
+      }
+      return [...fallback.errorRetryScheduleMs]
+    })(),
+    errorRetryMaxAttempts: asInt(raw?.errorRetryMaxAttempts, 1) ?? fallback.errorRetryMaxAttempts,
     honorProviderRetryAfter: asBool(raw?.honorProviderRetryAfter) ?? fallback.honorProviderRetryAfter,
     maxProviderRetryAfterMs: asInt(raw?.maxProviderRetryAfterMs, 1000) ?? fallback.maxProviderRetryAfterMs,
     overrides: normOverrides(overridesRaw, fallback.overrides),
@@ -512,6 +545,16 @@ interface ContinueState {
    *  的标记——不需要额外的 pending 标志（那玩意在只走兜底路径时会永久卡死：
    *  清它的 turn/start 事件同样收不到）。 */
   lastTurn: number
+  /**
+   * 错误重试链（升级退避）状态：
+   *  - attempt：本条错误链上已自动重试了几次（成功回合或人工发言清零）；
+   *  - timer：待触发的 setTimeout 句柄（人工发言/会话离场时清除，防止过期投递）；
+   *  - armedTurn：登记重试计划时的回合号。定时器到点时用它校验期间没有新回合：
+   *    有新回合说明 API 已恢复（或用户已接手），本次重试作废，attempt 清零。
+   */
+  errorAttempt: number
+  errorTimer: ReturnType<typeof setTimeout> | undefined
+  errorArmedTurn: number
 }
 
 /**
@@ -882,7 +925,7 @@ export function apply(ctx: Context, config: Partial<Config> | undefined): void {
   const stateOf = (id: string): ContinueState => {
     let state = states.get(id)
     if (!state) {
-      state = { chain: 0, capped: false, lastTurn: -1 }
+      state = { chain: 0, capped: false, lastTurn: -1, errorAttempt: 0, errorTimer: undefined, errorArmedTurn: -1 }
       states.set(id, state)
       // 长跑进程里会话只增不减：超上限丢最早插入的账本（谁被丢谁下次重新计数）
       while (states.size > STATE_MAX) {
@@ -915,14 +958,29 @@ export function apply(ctx: Context, config: Partial<Config> | undefined): void {
     const state = stateOf(String(session.id))
     if (state.lastTurn === turn) return
     state.lastTurn = turn
-    // 两种值得补一轮的结束原因：输出被 token 上限截断；或瞬时错误把重试耗光了
-    // （后者要用户显式打开 continueOnError，且只认 TRANSIENT_CONTINUE_CODES）。
+    // 两类值得自动接管的结束原因，处理策略不同：
+    //  - max-tokens 截断：廉价且即时，走原有即时链式（chain / maxContinuations 管）；
+    //  - 瞬时错误（重试彻底耗尽）：故障常持续几分钟到几十分钟，即时补一轮只会
+    //    立刻再失败。走升级退避调度（2→5→15→30min 封顶），到点重投一轮，
+    //    直到成功回合 / 人工发言 / 硬上限三者之一收链。
     const truncation = kind === 'max-tokens'
     const transientFailure = kind === 'error' && cfg.continueOnError && TRANSIENT_CONTINUE_CODES.has(errorCode ?? '')
     if (!truncation && !transientFailure) {
+      // 正常收尾（或确定性错误）：两条链都清零，销毁未触发的错误重试定时器。
+      if (state.errorTimer) {
+        clearTimeout(state.errorTimer)
+        state.errorTimer = undefined
+      }
       state.chain = 0
       state.capped = false
+      state.errorAttempt = 0
+      state.errorArmedTurn = -1
       return
+    }
+    if (truncation && state.errorAttempt > 0) {
+      // 截断说明模型请求已打通（API 恢复了）：错误链到此结束。
+      state.errorAttempt = 0
+      state.errorArmedTurn = -1
     }
     diag(
       `turn/end via=${via} session=${session.id} turn=${turn} kind=${kind}` +
@@ -930,6 +988,11 @@ export function apply(ctx: Context, config: Partial<Config> | undefined): void {
         ` maxContinuations=${cfg.maxContinuations} chain=${state.chain}`,
     )
     if (!cfg.autoContinue) return
+    // —— 瞬时错误：升级退避调度，不复用截断的即时链式 ——
+    if (transientFailure) {
+      scheduleErrorRetry(session, turn, via, agentHint, errorCode)
+      return
+    }
     if (state.chain >= cfg.maxContinuations) {
       if (!state.capped) {
         state.capped = true
@@ -1049,6 +1112,139 @@ export function apply(ctx: Context, config: Partial<Config> | undefined): void {
     attempt(1)
   }
 
+  /**
+   * 瞬时错误的升级退避调度器（看门狗核心）。
+   *
+   * 与截断链式（chain / maxContinuations）完全独立：
+   *  - 第 N 次重试（N 从 1 计）前等待 errorRetryScheduleMs[min(N-1, len-1)]；
+   *  - 到点后重新过全部守卫（ disposed / 新回合 / inbox 忙 / 开关被关 / 会话离场），
+   *    再投一轮 error 续写；若该轮仍以瞬时错误收尾，turn/end 会再次进入本函数排下一轮；
+   *  - 任何非瞬时错误的 turn/end（成功或确定性错误）在 handleTurnEnd 入口清零 attempt；
+   *  - 硬上限 errorRetryMaxAttempts：到顶停手 + 打 cap 点位 + 日志说明，等人工介入；
+   *  - 人工发言（user/message）清零 attempt 并 clearTimeout，用户接手即看门狗让位。
+   *
+   * 定时器只存在一个/会话：重复排程前先清旧的，重启场景（DSH 重开、会话 resume）
+   * 丢掉 pending 定时器是可接受的——兜底路径 agent/status→idle 会重新登记。
+   */
+  const scheduleErrorRetry = (
+    session: any,
+    turn: number,
+    via: string,
+    agentHint: any,
+    errorCode: string | undefined,
+  ): void => {
+    const cfg = current()
+    const state = stateOf(String(session.id))
+    const sessionId = String(session.id)
+
+    // 开关或链路被配置关掉：销毁定时器，账本清零（与 handleTurnEnd 入口的正常收尾一致）。
+    if (!cfg.autoContinue || !cfg.continueOnError) {
+      if (state.errorTimer) {
+        clearTimeout(state.errorTimer)
+        state.errorTimer = undefined
+      }
+      state.errorAttempt = 0
+      state.errorArmedTurn = -1
+      return
+    }
+
+    // 同一条错误链已在排队（定时器活着且登记的就是本回合）：不重复排。
+    if (state.errorTimer && state.errorArmedTurn === turn) return
+    // 新回合的瞬时错误：清掉旧定时器（它到点时也会因 lastTurn 不符而自弃）。
+    // 注意 errorAttempt 不清零：每次续写重试本身就是新回合，链的连续性以
+    // 「成功回合 / 确定性错误 / 人工发言」三种收链信号为准（handleTurnEnd 入口
+    // 与 user/message 处清零），不能按 turn 号判断——否则每次重试都是新号，
+    // 退避永远停在第 1 档、硬上限永不触发。
+    if (state.errorTimer) {
+      clearTimeout(state.errorTimer)
+      state.errorTimer = undefined
+    }
+
+    // 硬上限：到达后停手。提示只出一次（armTurn 置 -1 兼作已提示标记）。
+    if (state.errorAttempt >= cfg.errorRetryMaxAttempts) {
+      if (state.errorArmedTurn !== -1) {
+        state.errorArmedTurn = -1
+        stats.capped += 1
+        pushStat({ t: Date.now(), kind: 'cap', turn })
+        diag(`error-retry bail via=${via}: 硬上限触顶（${state.errorAttempt}/${cfg.errorRetryMaxAttempts}）session=${sessionId} code=${errorCode ?? '?'}`)
+        ctx.logger.warn(
+          `[dsh-llm-retry-watchdog] 会话 ${sessionId} 瞬时错误自动重试已达硬上限（${cfg.errorRetryMaxAttempts} 次，code=${errorCode ?? '?'}），停止重试等待人工介入`,
+        )
+      }
+      return
+    }
+
+    const delayMs = cfg.errorRetryScheduleMs[Math.min(state.errorAttempt, cfg.errorRetryScheduleMs.length - 1)]
+    state.errorAttempt += 1
+    state.errorArmedTurn = turn
+    const expectedAttempt = state.errorAttempt
+    diag(`error-retry armed via=${via} session=${sessionId} turn=${turn} attempt=${expectedAttempt}/${cfg.errorRetryMaxAttempts} delayMs=${delayMs} code=${errorCode ?? '?'}`)
+    state.errorTimer = setTimeout(() => {
+      state.errorTimer = undefined
+      void (async () => {
+        try {
+          if (disposed) return
+          const now = current()
+          // 期间被配置关掉：静默放弃，账本不清（下次开启由新事件重新计数）。
+          if (!now.autoContinue || !now.continueOnError) return
+          // 期间跑了新回合：API 已恢复或用户已接手，本链作废。
+          if (state.lastTurn !== turn || state.errorArmedTurn !== turn || state.errorAttempt !== expectedAttempt) {
+            diag(`error-retry 放弃 session=${sessionId} turn=${turn}：期间已出现新事件 lastTurn=${state.lastTurn}`)
+            return
+          }
+          let agent: any = agentHint
+          if (!agent) {
+            const agents: any = (ctx as any).agents
+            if (!agents || typeof agents.get !== 'function') return
+            agent = agents.get(sessionId)
+            if (!agent) {
+              diag(`error-retry 放弃 session=${sessionId}：agents.get 无实例`)
+              return
+            }
+          }
+          if (agent.session?.id !== session.id) return
+          if (typeof agent.followup !== 'function') return
+          // 用户已排了消息：让位，不投。
+          if (inboxBusy(agent)) {
+            stats.skipped += 1
+            pushStat({ t: Date.now(), kind: 'skip', turn })
+            diag(`error-retry 让位 session=${sessionId}：inbox 已有新消息`)
+            return
+          }
+          if (typeof agent.whenIdle === 'function') await agent.whenIdle()
+          // whenIdle 之后再核一遍守卫（等待期间可能有人发言/新回合）。
+          if (disposed || state.lastTurn !== turn || state.errorArmedTurn !== turn || state.errorAttempt !== expectedAttempt) return
+          if (inboxBusy(agent)) {
+            stats.skipped += 1
+            pushStat({ t: Date.now(), kind: 'skip', turn })
+            return
+          }
+          const fresh = current()
+          const custom = fresh.continuationPrompt.trim()
+          const prompt = custom || DEFAULT_ERROR_CONTINUATION_PROMPT
+          agent.followup(makeContinuationMessage(prompt))
+          stats.continues += 1
+          const known = models.get(sessionId)
+          pushStat({ t: Date.now(), kind: 'continue', turn, provider: known?.provider, model: known?.model })
+          diag(`error-retry 续写已投递 session=${sessionId} turn=${turn} attempt=${expectedAttempt}/${fresh.errorRetryMaxAttempts} prompt=${custom ? 'custom' : 'default'}`)
+        } catch (error) {
+          diag(`error-retry 投递异常 session=${sessionId} turn=${turn}：${String(error)}`)
+          if (String(error).includes('reenter')) {
+            // 重入错误 = 未入队，短延迟后原样重试一次（attempt 已计，不回退）。
+            setTimeout(() => {
+              state.errorTimer = undefined
+              scheduleErrorRetry(session, turn, via + '+reenter', agentHint, errorCode)
+            }, 1000)
+          }
+        }
+      })()
+    }, delayMs)
+    // 不让定时器挂住进程退出。
+    if (typeof state.errorTimer === 'object' && state.errorTimer && 'unref' in state.errorTimer) {
+      ;(state.errorTimer as unknown as { unref: () => void }).unref()
+    }
+  }
+
   ctx.on(
     'session/event',
     (session: any, event: any) => {
@@ -1059,11 +1255,19 @@ export function apply(ctx: Context, config: Partial<Config> | undefined): void {
             const state = stateOf(String(session.id))
             const source = event.data && event.data.source
             const kind = source && source.kind
-            // 真人重新发言 = 旧截断链作废，计数归零
+            // 真人重新发言 = 旧截断链作废，计数归零；错误重试链同理，且要销毁
+            // 未触发的定时器——用户接手后看门狗必须彻底闭嘴。
             if (kind === 'user') {
               if (state.chain > 0) diag(`人工发言，重置续写链 session=${session.id} chain=${state.chain}`)
               state.chain = 0
               state.capped = false
+              if (state.errorTimer) {
+                clearTimeout(state.errorTimer)
+                state.errorTimer = undefined
+              }
+              if (state.errorAttempt > 0) diag(`人工发言，撤销错误重试 session=${session.id} attempt=${state.errorAttempt}`)
+              state.errorAttempt = 0
+              state.errorArmedTurn = -1
               return
             }
             // 识别自己的续写消息：v4 形态 kind='plugin:'+NS（历史会话迁移后也是它），
@@ -1124,10 +1328,15 @@ export function apply(ctx: Context, config: Partial<Config> | undefined): void {
     }
   })
 
-  // 会话离场即清账本，避免长跑进程里 Map 无界增长
+  // 会话离场即清账本，避免长跑进程里 Map 无界增长；同时销毁未触发的重试定时器
   ctx.on('session/disposed', (session: any) => {
     if (!session) return
     const id = String(session.id)
+    const state = states.get(id)
+    if (state?.errorTimer) {
+      clearTimeout(state.errorTimer)
+      state.errorTimer = undefined
+    }
     states.delete(id)
     models.delete(id)
   })
