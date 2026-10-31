@@ -1,0 +1,6 @@
+{
+  "name": "dsh-llm-retry-watchdog",
+  "version": "0.2.0",
+  "description": "DSH 插件：LLM 重试耗尽后的看门狗——瞬时错误按 2→5→15→30 分钟升级退避持续补投「继续」，直到恢复/人工接手/硬上限。fork 自 zeng6125-rgb/dsh-llm-retry-settings。",
+  "repository": "Geetie/dsh-llm-retry-watchdog"
+}
